@@ -2,10 +2,10 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strings"
+	"sync"
 )
 
 const (
@@ -23,7 +23,11 @@ type message struct {
 	content  string
 }
 
-var connections []connection
+var (
+	connections []connection
+	chat        = make(chan message)
+	connMutex   sync.Mutex
+)
 
 func main() {
 	listener, err := net.Listen(listenerProtocol, listenerAddress)
@@ -33,58 +37,65 @@ func main() {
 	defer listener.Close()
 	log.Printf("Listening on %s", listenerAddress)
 
-	chat := make(chan message)
+	go handleChat()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			log.Printf("error accepting connection: %v\n", err)
+			continue
 		}
 
-		go handleConnection(conn, chat)
-		go handleChat(chat)
+		go handleConnection(conn)
 	}
 }
 
-func handleConnection(conn net.Conn, chat chan message) {
-	remoteAddr := conn.RemoteAddr().String()
-	log.Printf("Serving %s\n", remoteAddr)
+func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	conn.Write([]byte("Hi! What's your name: "))
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
-		log.Printf("error readind message: %v\n", err)
+		log.Printf("error reading message: %v\n", err)
+		return
 	}
 	username := strings.TrimSpace(string(buf[:n]))
+
+	connMutex.Lock()
 	connections = append(connections, connection{
 		conn:     conn,
 		username: username,
 	})
+	connMutex.Unlock()
+
 	chat <- message{username: username, content: fmt.Sprintf("INFO: %s joined the chat.\n", username)}
 	conn.Write([]byte("Welcome, " + username + "!\n"))
 
 	for {
 		buf := make([]byte, 1024)
 		n, err := conn.Read(buf)
-		if err == io.EOF {
-			break
-		}
 		if err != nil {
-			log.Printf("error readind message: %v\n", err)
+			log.Printf("error reading message: %v\n", err)
+			break
 		}
 		content := strings.TrimSpace(string(buf[:n]))
 		chat <- message{username: username, content: fmt.Sprintf("%s: %s\n", username, content)}
 	}
 }
 
-func handleChat(chat chan message) {
-	for message := range chat {
+func handleChat() {
+	for msg := range chat {
+		connMutex.Lock()
 		for _, connection := range connections {
-			if connection.username == message.username {
+			if connection.username == msg.username {
 				continue
 			}
-			connection.conn.Write([]byte(message.content))
+			_, err := connection.conn.Write([]byte(msg.content))
+			if err != nil {
+				log.Printf("error writing message to %s: %v\n", connection.username, err)
+			}
 		}
+		connMutex.Unlock()
 	}
 }
